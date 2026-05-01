@@ -1142,6 +1142,23 @@ enum aiComponent
 #define AI_CONFIG_EXPORT_FBX_TRANSPARENCY_FACTOR_REFER_TO_OPACITY \
         "EXPORT_FBX_TRANSPARENCY_FACTOR_REFER_TO_OPACITY"
 
+/** @brief Specifies whether the FBX exporter shares one Geometry block between
+ *  nodes that reference the same aiMesh (i.e. instances).
+ *
+ * When this flag is true (the default), nodes whose mMeshes tuple matches an
+ * already-emitted Geometry are connected to the existing block via a second
+ * Model->Geometry connection, mirroring how Maya/3ds Max/Blender produce FBX.
+ * When false, each node emits its own Geometry block (the pre-fix behavior),
+ * which can be useful if a downstream consumer cannot handle shared geometry.
+ *
+ * Skinned meshes (mNumBones > 0) are never deduplicated regardless of this
+ * flag, because the FBX deformer attaches per-Geometry.
+ *
+ * Property type: Bool. Default value: true.
+ */
+#define AI_CONFIG_EXPORT_FBX_INSTANCED_GEOMETRY \
+        "EXPORT_FBX_INSTANCED_GEOMETRY"
+
 /**
  * @brief Specifies the blob name, assimp uses for exporting.
  * 

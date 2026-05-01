@@ -1101,9 +1101,12 @@ void FBXExporter::WriteObjects () {
     std::vector<uint32_t> uniq_v_before_mi;
 
     const auto bTransparencyFactorReferencedToOpacity = mProperties->GetPropertyBool(AI_CONFIG_EXPORT_FBX_TRANSPARENCY_FACTOR_REFER_TO_OPACITY, false);
+    const bool bInstancedGeometry = mProperties->GetPropertyBool(AI_CONFIG_EXPORT_FBX_INSTANCED_GEOMETRY, true);
 
     // geometry (aiMesh)
     mesh_uids.clear();
+    geometry_uids_by_signature.clear();
+    bool skinned_dedupe_skipped_logged = false;
     indent = 1;
     std::function<void(const aiNode*)> visit_node_geo = [&](const aiNode *node) {
         if (node->mNumMeshes == 0) {
@@ -1113,10 +1116,43 @@ void FBXExporter::WriteObjects () {
           return;
         }
 
+        // Try to dedupe: if another node already emitted Geometry for the
+        // same ordered mMeshes tuple, point this node at it and skip emission.
+        // Skinned meshes are never deduped; FBX deformers attach per-Geometry.
+        bool any_skinned = false;
+        for (uint32_t n_mi = 0; n_mi < node->mNumMeshes; ++n_mi) {
+            if (mScene->mMeshes[node->mMeshes[n_mi]]->HasBones()) {
+                any_skinned = true;
+                break;
+            }
+        }
+        const bool dedupe_eligible = bInstancedGeometry && !any_skinned;
+        std::vector<unsigned int> signature;
+        if (dedupe_eligible) {
+            signature.assign(node->mMeshes, node->mMeshes + node->mNumMeshes);
+            auto it = geometry_uids_by_signature.find(signature);
+            if (it != geometry_uids_by_signature.end()) {
+                mesh_uids[node] = it->second;
+                for (uint32_t ni = 0; ni < node->mNumChildren; ni++) {
+                    visit_node_geo(node->mChildren[ni]);
+                }
+                return;
+            }
+        } else if (any_skinned && bInstancedGeometry && !skinned_dedupe_skipped_logged) {
+            ASSIMP_LOG_INFO(
+                    "FBX exporter: skipping shared-Geometry deduplication for "
+                    "skinned mesh(es); per-instance deformers require per-Geometry "
+                    "emission.");
+            skinned_dedupe_skipped_logged = true;
+        }
+
         // start the node record
         FBX::Node n("Geometry");
         int64_t uid = generate_uid();
         mesh_uids[node] = uid;
+        if (dedupe_eligible) {
+            geometry_uids_by_signature[std::move(signature)] = uid;
+        }
         n.AddProperty(uid);
         n.AddProperty(FBX::SEPARATOR + "Geometry");
         n.AddProperty("Mesh");

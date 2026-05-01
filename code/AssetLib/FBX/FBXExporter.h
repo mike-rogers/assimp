@@ -91,6 +91,7 @@ namespace Assimp {
         std::vector<FBX::Node> connections; // connection storage
 
         std::map<const aiNode*, int64_t> mesh_uids;
+        std::map<std::vector<unsigned int>, int64_t> geometry_uids_by_signature;
         std::vector<int64_t> blendshape_uids;
         std::vector<int64_t> material_uids;
         std::map<const aiNode*,int64_t> node_uids;

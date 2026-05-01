@@ -43,11 +43,15 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "UnitTestPCH.h"
 
 #include <assimp/commonMetaData.h>
+#include <assimp/config.h>
 #include <assimp/material.h>
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
 #include <assimp/types.h>
+#include <assimp/Exporter.hpp>
 #include <assimp/Importer.hpp>
+
+#include <string>
 
 using namespace Assimp;
 
@@ -461,3 +465,228 @@ TEST_F(utFBXImporterExporter, importSkeletonTest) {
     ASSERT_NE(nullptr, scene);
     ASSERT_TRUE(scene->mRootNode);
 }
+
+#ifndef ASSIMP_BUILD_NO_FBX_EXPORTER
+
+namespace {
+
+aiMesh *makeTriangleMesh(unsigned int materialIndex = 0) {
+    aiMesh *mesh = new aiMesh;
+    mesh->mNumVertices = 3;
+    mesh->mVertices = new aiVector3D[3];
+    mesh->mVertices[0] = aiVector3D(0.f, 0.f, 0.f);
+    mesh->mVertices[1] = aiVector3D(1.f, 0.f, 0.f);
+    mesh->mVertices[2] = aiVector3D(0.f, 1.f, 0.f);
+    mesh->mNumFaces = 1;
+    mesh->mFaces = new aiFace[1];
+    mesh->mFaces[0].mNumIndices = 3;
+    mesh->mFaces[0].mIndices = new unsigned int[3];
+    mesh->mFaces[0].mIndices[0] = 0;
+    mesh->mFaces[0].mIndices[1] = 1;
+    mesh->mFaces[0].mIndices[2] = 2;
+    mesh->mMaterialIndex = materialIndex;
+    return mesh;
+}
+
+aiNode *makeMeshNode(const char *name, unsigned int meshIndex, aiNode *parent) {
+    aiNode *node = new aiNode(name);
+    node->mNumMeshes = 1;
+    node->mMeshes = new unsigned int[1];
+    node->mMeshes[0] = meshIndex;
+    node->mParent = parent;
+    return node;
+}
+
+aiNode *makeMultiMeshNode(const char *name, std::initializer_list<unsigned int> meshIndices, aiNode *parent) {
+    aiNode *node = new aiNode(name);
+    node->mNumMeshes = static_cast<unsigned int>(meshIndices.size());
+    node->mMeshes = new unsigned int[node->mNumMeshes];
+    std::copy(meshIndices.begin(), meshIndices.end(), node->mMeshes);
+    node->mParent = parent;
+    return node;
+}
+
+size_t countOccurrences(const aiExportDataBlob *blob, const std::string &needle) {
+    if (!blob || !blob->data || blob->size == 0) return 0;
+    const std::string haystack(static_cast<const char *>(blob->data), blob->size);
+    size_t count = 0;
+    size_t pos = 0;
+    while ((pos = haystack.find(needle, pos)) != std::string::npos) {
+        ++count;
+        pos += needle.size();
+    }
+    return count;
+}
+
+aiScene *makeTwoNodeOneMeshScene() {
+    aiScene *scene = new aiScene;
+    scene->mNumMeshes = 1;
+    scene->mMeshes = new aiMesh *[1];
+    scene->mMeshes[0] = makeTriangleMesh();
+    scene->mNumMaterials = 1;
+    scene->mMaterials = new aiMaterial *[1];
+    scene->mMaterials[0] = new aiMaterial;
+
+    scene->mRootNode = new aiNode("RootNode");
+    scene->mRootNode->mNumChildren = 2;
+    scene->mRootNode->mChildren = new aiNode *[2];
+    scene->mRootNode->mChildren[0] = makeMeshNode("InstanceA", 0, scene->mRootNode);
+    scene->mRootNode->mChildren[1] = makeMeshNode("InstanceB", 0, scene->mRootNode);
+    return scene;
+}
+
+} // namespace
+
+// Two nodes share one aiMesh (index identity). Default-on dedupe should emit
+// a single Geometry block with two Model->Geometry connections.
+TEST_F(utFBXImporterExporter, exportSharedMeshDedupesGeometry) {
+    aiScene *scene = makeTwoNodeOneMeshScene();
+
+    Assimp::Exporter exporter;
+    const aiExportDataBlob *blob = exporter.ExportToBlob(scene, "fbxa");
+    ASSERT_NE(nullptr, blob);
+
+    EXPECT_EQ(1u, countOccurrences(blob, "\tGeometry: "));
+    // Two mesh-Model entries reference the single Geometry block. With one
+    // shared Geometry + two Models, the FBX Connections section must emit
+    // two Model->Geometry connections.
+    EXPECT_EQ(2u, countOccurrences(blob, "\tModel: "));
+
+    delete scene;
+}
+
+// Two distinct aiMesh entries with identical vertex content should NOT be
+// deduped; assimp's instancing primitive is index identity, not content.
+TEST_F(utFBXImporterExporter, exportDistinctIdenticalMeshesStayDistinct) {
+    aiScene *scene = new aiScene;
+    scene->mNumMeshes = 2;
+    scene->mMeshes = new aiMesh *[2];
+    scene->mMeshes[0] = makeTriangleMesh();
+    scene->mMeshes[1] = makeTriangleMesh();
+    scene->mNumMaterials = 1;
+    scene->mMaterials = new aiMaterial *[1];
+    scene->mMaterials[0] = new aiMaterial;
+
+    scene->mRootNode = new aiNode("RootNode");
+    scene->mRootNode->mNumChildren = 2;
+    scene->mRootNode->mChildren = new aiNode *[2];
+    scene->mRootNode->mChildren[0] = makeMeshNode("A", 0, scene->mRootNode);
+    scene->mRootNode->mChildren[1] = makeMeshNode("B", 1, scene->mRootNode);
+
+    Assimp::Exporter exporter;
+    const aiExportDataBlob *blob = exporter.ExportToBlob(scene, "fbxa");
+    ASSERT_NE(nullptr, blob);
+
+    EXPECT_EQ(2u, countOccurrences(blob, "\tGeometry: "));
+
+    delete scene;
+}
+
+// AI_CONFIG_EXPORT_FBX_INSTANCED_GEOMETRY=false restores the pre-fix behavior:
+// one Geometry per node, even for shared meshes.
+TEST_F(utFBXImporterExporter, exportSharedMeshNotDedupedWhenFlagDisabled) {
+    aiScene *scene = makeTwoNodeOneMeshScene();
+
+    Assimp::Exporter exporter;
+    Assimp::ExportProperties props;
+    props.SetPropertyBool(AI_CONFIG_EXPORT_FBX_INSTANCED_GEOMETRY, false);
+    const aiExportDataBlob *blob = exporter.ExportToBlob(scene, "fbxa", 0, &props);
+    ASSERT_NE(nullptr, blob);
+
+    EXPECT_EQ(2u, countOccurrences(blob, "\tGeometry: "));
+
+    delete scene;
+}
+
+// Skinned shared meshes must NOT be deduped: deformers attach per-Geometry,
+// and skinned-instance support is out of scope for this fix.
+TEST_F(utFBXImporterExporter, exportSkinnedSharedMeshNotDeduped) {
+    aiScene *scene = new aiScene;
+    scene->mNumMeshes = 1;
+    scene->mMeshes = new aiMesh *[1];
+    aiMesh *mesh = makeTriangleMesh();
+    mesh->mNumBones = 1;
+    mesh->mBones = new aiBone *[1];
+    mesh->mBones[0] = new aiBone;
+    mesh->mBones[0]->mName.Set("Bone");
+    mesh->mBones[0]->mNumWeights = 1;
+    mesh->mBones[0]->mWeights = new aiVertexWeight[1];
+    mesh->mBones[0]->mWeights[0].mVertexId = 0;
+    mesh->mBones[0]->mWeights[0].mWeight = 1.0f;
+    scene->mMeshes[0] = mesh;
+    scene->mNumMaterials = 1;
+    scene->mMaterials = new aiMaterial *[1];
+    scene->mMaterials[0] = new aiMaterial;
+
+    scene->mRootNode = new aiNode("RootNode");
+    scene->mRootNode->mNumChildren = 3; // two mesh-nodes + one bone-node
+    scene->mRootNode->mChildren = new aiNode *[3];
+    scene->mRootNode->mChildren[0] = makeMeshNode("InstanceA", 0, scene->mRootNode);
+    scene->mRootNode->mChildren[1] = makeMeshNode("InstanceB", 0, scene->mRootNode);
+    scene->mRootNode->mChildren[2] = new aiNode("Bone");
+    scene->mRootNode->mChildren[2]->mParent = scene->mRootNode;
+
+    Assimp::Exporter exporter;
+    const aiExportDataBlob *blob = exporter.ExportToBlob(scene, "fbxa");
+    ASSERT_NE(nullptr, blob);
+
+    EXPECT_EQ(2u, countOccurrences(blob, "\tGeometry: "));
+
+    delete scene;
+}
+
+// Two nodes that share the same multi-mesh signature (e.g. both reference
+// meshes [0, 1] in the same order) must dedupe to a single combined Geometry.
+// Confirms the signature key is the full ordered tuple, not just mMeshes[0].
+TEST_F(utFBXImporterExporter, exportSharedMultiMeshSignatureDedupes) {
+    aiScene *scene = new aiScene;
+    scene->mNumMeshes = 2;
+    scene->mMeshes = new aiMesh *[2];
+    scene->mMeshes[0] = makeTriangleMesh();
+    scene->mMeshes[1] = makeTriangleMesh();
+    scene->mNumMaterials = 1;
+    scene->mMaterials = new aiMaterial *[1];
+    scene->mMaterials[0] = new aiMaterial;
+
+    scene->mRootNode = new aiNode("RootNode");
+    scene->mRootNode->mNumChildren = 2;
+    scene->mRootNode->mChildren = new aiNode *[2];
+    scene->mRootNode->mChildren[0] = makeMultiMeshNode("InstanceA", { 0, 1 }, scene->mRootNode);
+    scene->mRootNode->mChildren[1] = makeMultiMeshNode("InstanceB", { 0, 1 }, scene->mRootNode);
+
+    Assimp::Exporter exporter;
+    const aiExportDataBlob *blob = exporter.ExportToBlob(scene, "fbxa");
+    ASSERT_NE(nullptr, blob);
+
+    // One combined Geometry block emitted for the shared [0,1] signature, with
+    // a Model entry per instance node referencing it.
+    EXPECT_EQ(1u, countOccurrences(blob, "\tGeometry: "));
+    EXPECT_EQ(2u, countOccurrences(blob, "\tModel: "));
+
+    delete scene;
+}
+
+// End-to-end: export a shared-mesh scene, re-import via assimp, and confirm
+// the importer recognizes one shared aiMesh (not two duplicates). Validates
+// the full export->import roundtrip preserves instance identity.
+TEST_F(utFBXImporterExporter, exportSharedMeshRoundtripPreservesIdentity) {
+    aiScene *scene = makeTwoNodeOneMeshScene();
+
+    Assimp::Exporter exporter;
+    const aiExportDataBlob *blob = exporter.ExportToBlob(scene, "fbx");
+    ASSERT_NE(nullptr, blob);
+
+    Assimp::Importer importer;
+    const aiScene *roundtripped = importer.ReadFileFromMemory(
+            blob->data, blob->size, aiProcess_ValidateDataStructure, "fbx");
+    ASSERT_NE(nullptr, roundtripped);
+
+    // The exporter wrote a single Geometry shared across two Models; the
+    // importer's MeshGeometry-keyed cache must collapse those back into one
+    // aiMesh referenced by multiple nodes.
+    EXPECT_EQ(1u, roundtripped->mNumMeshes);
+
+    delete scene;
+}
+
+#endif // ASSIMP_BUILD_NO_FBX_EXPORTER
